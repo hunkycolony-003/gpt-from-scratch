@@ -58,45 +58,84 @@ def estimate_loss():
     model.train()
     return out
 
-# encoder head
-class Head(nn.Module):
-    def __init__(self, head_size):
-        super().__init__()
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+# Naive ultiheaded attention
+# class Head(nn.Module):
+#     def __init__(self, head_size):
+#         super().__init__()
+#         self.query = nn.Linear(n_embed, head_size, bias=False)
+#         self.key = nn.Linear(n_embed, head_size, bias=False)
+#         self.value = nn.Linear(n_embed, head_size, bias=False)
+#         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
-        self.dropout = nn.Dropout(dropout)
+#         self.dropout = nn.Dropout(dropout)
     
+#     def forward(self, x):
+#         B, T, C = x.shape
+
+#         q = self.query(x)
+#         k = self.key(x)
+#         wei = q @ k.transpose(-2, -1) * C**-0.5
+
+#         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+#         wei = F.softmax(wei, dim=-1)
+#         wei = self.dropout(wei)
+#         v = self.value(x)
+#         out = wei @ v
+#         return out
+    
+
+# class MultiheadAttention(nn.Module):
+#     def __init__(self, n_heads, head_size):
+#         super().__init__()
+#         self.heads = nn.ModuleList(Head(head_size) for _ in range(n_heads))
+#         self.proj = nn.Linear(n_embed, n_embed)
+#         self.dropout = nn.Dropout(dropout)
+
+#     def forward(self, x):
+#         out = torch.cat([head(x) for head in self.heads], dim=-1)
+#         out = self.proj(out)
+#         out = self.dropout(out)
+#         return out
+
+
+# vectorised mlh
+class CausalSelfAttention(nn.Module):
+    def __init__(self, n_heads, n_embed):
+        super().__init__()
+
+        self.c_attn = nn.Linear(n_embed, 3 * n_embed, bias=False)
+        self.c_proj = nn.Linear(n_embed, n_embed)
+        self.head_size = n_embed // n_heads
+
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+
+
     def forward(self, x):
+        """
+        x: (B, T, C)
+        out: 
+        """
         B, T, C = x.shape
 
-        q = self.query(x)
-        k = self.key(x)
-        wei = q @ k.transpose(-2, -1) * C**-0.5
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(n_embed, 2) # each are (B, T, n_embed)
 
+        # convert to (B, nh, T, n_embed)
+        q = q.view(B, T, n_heads, -1).transpose(1, 2)
+        k = k.view(B, T, n_heads, -1).transpose(1, 2)
+        v = v.view(B, T, n_heads, -1).transpose(1, 2)
+
+        wei = q @ k.transpose(-2, -1) *self.head_size**-0.5 # (B, H, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-        v = self.value(x)
-        out = wei @ v
-        return out
-    
 
-class MultiheadAttention(nn.Module):
-    def __init__(self, n_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList(Head(head_size) for _ in range(n_heads))
-        self.proj = nn.Linear(n_embed, n_embed)
-        self.dropout = nn.Dropout(dropout)
+        out = wei @ v # (B, nh, T, head_size)
+        out = out.transpose(1, 2) # (B, T, nh, head_size)
+        out = out.view(B, T, C)
+        out = self.c_proj(out) 
 
-    def forward(self, x):
-        out = torch.cat([head(x) for head in self.heads], dim=-1)
-        out = self.proj(out)
-        out = self.dropout(out)
         return out
-    
+
 
 class FeedForward(nn.Module):
     def __init__(self, d_hidden=4*n_embed):
@@ -113,10 +152,9 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, n_embed, n_heads):
+    def __init__(self, n_heads, n_embed):
         super().__init__()
-        head_size = n_embed // n_heads
-        self.mlh = MultiheadAttention(n_heads, head_size)
+        self.mlh = CausalSelfAttention(n_heads, n_embed)
         self.ffwd = FeedForward()
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -134,7 +172,7 @@ class GPTLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.positional_embedding_table = nn.Embedding(block_size, n_embed)
         self.dropout = nn.Dropout(dropout)
-        self.blocks = nn.Sequential(*[Block(n_embed, n_heads=n_heads) for _ in range(n_layers)])
+        self.blocks = nn.Sequential(*[Block(n_embed=n_embed, n_heads=n_heads) for _ in range(n_layers)])
         self.lnf = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
