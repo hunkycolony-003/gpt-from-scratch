@@ -131,7 +131,7 @@ class CausalSelfAttention(nn.Module):
 
         out = wei @ v # (B, nh, T, head_size)
         out = out.transpose(1, 2) # (B, T, nh, head_size)
-        out = out.view(B, T, C)
+        out = out.reshape(B, T, C)
         out = self.c_proj(out) 
 
         return out
