@@ -1,15 +1,100 @@
-## Attention Explaination
+# Attention and KV-Cache Benchmarking
 
-If we weighted sum all the previous contexts in the T-th token, we can then predict the next token only given the T-th token efficiently. So our most important task to find out the weights(masked) for the averaging operation. Ask yourself, which weights should be higher for average upto the T-th token, where the T-th token gets the averaged value ? Probably the ones the T-th token find more useful for prediction. So it spits out a query vector for all the tokens upto itelf to release their key vector for it to calculate a attention score, to be then softmaxed and and calculate the weights.
+A PyTorch, nanoGPT-style decoder for comparing Multi-Head Attention (MHA), Multi-Query Attention (MQA), Grouped-Query Attention (GQA), and Multi-Head Latent Attention (MLA). The project implements the attention variants and cached decoding, then measures cache size, prefill throughput, decode latency, and validation perplexity.
 
-To calculate the weighted avg itself, each vector has a different set of vectors called values, onto which the avg is calculated
+## What I built
 
-Two type of broad distinction can be made in the attention mechanism, between self attention and cross-attention and between encoder and decoder attention module.
+- Four interchangeable attention modules in [`model.py`](model.py).
+- MLA with decoupled rotary position keys and a compressed latent KV representation.
+- Prompt prefill and token-by-token cached decoding.
+- A benchmark runner for prefill, cached decode, cache footprint, and incremental forward memory in [`benchmark.py`](benchmark.py).
+- A numerical check comparing full-sequence output with token-by-token cached output in [`tests/test_correctness.py`](tests/test_correctness.py).
 
-To understand the difference between them, take a step back and think about how general the attention mechanism itself is: you give it s 'set' of vectors, some of the vectors are directed to some of the other vectors or itself. This forms a directed graph, which represents attention of a single batch. The set of all the vectors each vector is pointed to by, participates in calculating the attentyion score for this vector. i.e. when a vectors spits out a query, the keys and values are given by only the set of vectors it is being pointed to by. It does not need you to be autoregressive(i.e. causal) or fully connected or anything like that.
+## Results
 
-With this view in mind, the difference between the mechanisms should fairly simple. In self attention each vector in the set gives a query and a subset of vectors in the same set gives their key and values for each query. In cross attention, you can divide the vectors into two subsets, one of which gives out query but the keys and the values is only given by the other subset of vectors and the other set of vectors is pointed to by none, so they dont give query vectors. So the edges go from only one set of vectors to the other and neither the other way nor by vector to itself.
+The benchmark numbers below are from an NVIDIA A100 40 GB, PyTorch 2.14.0+cu130, CUDA 13.0, bfloat16, seed 42, with `torch.compile` enabled. The GQA implementation used the manual attention path. These figures compare the current implementations and are not a comparison of optimized production kernels.
 
-The encoder and dedocer is most widely used but specific type of attention. The encoder is a [complete directed graph](https://en.wikipedia.org/wiki/Directed_graph#:~:text=Complete%20directed%20graphs%20are%20simple%20directed%20graphs%20where%20each%20pair%20of%20vertices%20is%20joined%20by%20a%20symmetric%20pair%20of%20directed%20arcs%20(it%20is%20equivalent%20to%20an%20undirected%20complete%20graph%20with%20the%20edges%20replaced%20by%20pairs%20of%20inverse%20arcs).%20It%20follows%20that%20a%20complete%20digraph%20is%20symmetric.), where each vector points to each of the vectors, including itself, so each one gives a query and all the vectors attend to it with keys and values. On the other hand decoder block is used for causal auto regressive tasks where the vectors are ordered and each vector is pointed by the all the vectors ordered upto itself.
+### KV-cache footprint
 
-Because or the exponential (peaky) nature of softmax, we used scaled dot product attention, other wise the softmax converges to one-hot vectors to the max value.
+Measured tensor sizes after a prompt prefill at batch size 32 and sequence length 2048:
+
+| Attention | Cache size | Reduction vs MHA |
+| --- | ---: | ---: |
+| MHA | 2,304 MB | — |
+| GQA | 576 MB | 75.0% |
+| MLA | 240 MB | 89.6% |
+| MQA | 192 MB | 91.7% |
+
+The measured tensor sizes match the analytical cache-size formulas. MLA stores a 128-dimensional latent and a 32-dimensional positional key per token per layer. Its cache is 58.3% smaller than GQA's in this configuration.
+
+### Throughput and decode latency
+
+| Attention | Prefill, B=32 / T=2048 | Decode, B=1 | Decode, B=32 |
+| --- | ---: | ---: | ---: |
+| MHA | 214k tokens/s | 10.14 ms/token | 10.29 ms/token |
+| GQA | 229k tokens/s | 12.26 ms/token | 12.51 ms/token |
+| MLA | 150k tokens/s | 14.10 ms/token | 15.28 ms/token |
+| MQA | 230k tokens/s | 11.41 ms/token | 12.33 ms/token |
+
+Prefill throughput is calculated from median latency across 10 measured runs. Decode latency is averaged across steps 2–50 after a 512-token prompt; step 1 is excluded to reduce one-time startup effects. The model dynamically extends cache tensors with concatenation at each step. This adds copying work and is a limitation of the current decode benchmark.
+
+In this implementation, MLA's smaller cache does not make it faster: it is slower than GQA in both measured workloads. The prefill path up-projects latent keys and values and computes separate content and positional attention scores. During decode, MLA attends over the compressed representation but still performs additional projection and score work. A fixed-capacity cache and specialized fused attention kernels would be needed to assess performance closer to optimized serving systems.
+
+![Prefill throughput by batch size](outputs/prefill_throughput.png)
+
+![Cached decode throughput by batch size](outputs/decode_throughput.png)
+
+### Small-data perplexity check
+
+Each variant was trained for 150 steps with the same 4-layer, 4-head, 128-dimensional setup on the bundled TinyShakespeare text. Evaluation used a 90/10 token split. This is a single-seed sanity check, not a broad quality comparison.
+
+| Attention | Validation loss | Perplexity | Change vs MHA |
+| --- | ---: | ---: | ---: |
+| MHA | 6.3482 | 571.44 | baseline |
+| GQA | 6.3454 | 569.88 | -0.27% |
+| MQA | 6.3562 | 576.07 | +0.81% |
+| MLA | 6.3178 | 554.33 | -2.99% |
+
+These results show what happened in this run; multiple seeds and larger evaluation data are needed before attributing the differences to the attention variants.
+
+## Implementation notes
+
+In MLA, the content key is reconstructed from a compressed latent, while positional information is kept in a separate RoPE-rotated key. Separating content and position lets cached decoding score against the latent directly, avoiding storage of full per-head keys and values. The implementation is educational and functional, but does not include a preallocated KV cache or a custom fused MLA kernel.
+
+The attention variants have different parameter counts, so results reflect both architectural and implementation differences. The benchmark also reports incremental forward-pass memory separately from cache tensor size; incremental memory is not total GPU memory usage.
+
+## Run it
+
+Install the core dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run the correctness checks:
+
+```bash
+python tests/test_correctness.py
+```
+
+Run a local benchmark on the available device:
+
+```bash
+python benchmark.py --attention mha mqa gqa mla --seq-len 256 512 1024 2048 --batch-size 1 8 16 32 --output-dir outputs
+```
+
+Run the benchmark on Modal with an A100:
+
+```bash
+modal run modal_benchmark.py
+```
+
+Install the Modal CLI separately with `pip install modal` and authenticate with `modal setup` before running it.
+
+Run the small-data training and perplexity comparison:
+
+```bash
+python eval_perplexity.py
+```
+
+Benchmark CSVs, metadata, and plots are written under [`outputs/`](outputs/).

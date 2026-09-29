@@ -1,0 +1,12 @@
+{
+  "pytorch_version": "2.14.0+cu130",
+  "cuda_version": "13.0",
+  "device": "cuda",
+  "device_name": "NVIDIA A100-SXM4-40GB",
+  "seed": 42,
+  "dtype": "bfloat16",
+  "kernel": "eager_compiled",
+  "n_warmup": 3,
+  "n_runs": 10,
+  "timestamp": "2026-09-29 06:32:29 UTC"
+}
